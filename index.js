@@ -1,287 +1,86 @@
 const { Client, GatewayIntentBits, Events, EmbedBuilder, SlashCommandBuilder, REST, Routes } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
-const ytdl = require('ytdl-core');
-const { YouTube } = require('youtube-sr');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } = require('@discordjs/voice');
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const fs = require('fs');
+const path = require('path');
 const SpotifyWebApi = require('spotify-web-api-node');
-const { SoundCloud } = require('soundcloud-scraper');
 require('dotenv').config();
+
+const execAsync = promisify(exec);
 
 // Initialize Discord client
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.MessageContent
+        GatewayIntentBits.GuildVoiceStates
     ]
 });
 
-// Initialize Spotify API (optional)
+// Initialize Spotify API
 const spotifyApi = new SpotifyWebApi({
     clientId: process.env.SPOTIFY_CLIENT_ID,
     clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
 });
 
-// Initialize SoundCloud scraper (v5.0.3 compatibility)
-const soundcloud = new SoundCloud();
-
-// Music queue and player management
+// Music queues and players
 const musicQueues = new Map();
 const audioPlayers = new Map();
 
-class MusicQueue {
-    constructor(guildId, voiceChannel, textChannel) {
-        this.guildId = guildId;
-        this.voiceChannel = voiceChannel;
-        this.textChannel = textChannel;
-        this.songs = [];
-        this.currentSong = null;
-        this.isPlaying = false;
-        this.isPaused = false;
-        this.volume = 0.5;
-    }
-
-    addSong(song) {
-        this.songs.push(song);
-    }
-
-    getNextSong() {
-        return this.songs.shift();
-    }
-
-    clear() {
-        this.songs = [];
-        this.currentSong = null;
-        this.isPlaying = false;
-        this.isPaused = false;
-    }
+// Create downloads directory
+const downloadsDir = path.join(__dirname, 'downloads');
+if (!fs.existsSync(downloadsDir)) {
+    fs.mkdirSync(downloadsDir, { recursive: true });
 }
 
-// Utility functions for different music sources
-class MusicSourceHandler {
-    static async searchYouTube(query) {
-        try {
-            const results = await YouTube.search(query, { limit: 5, type: 'video' });
-            return results.map(video => ({
-                title: video.title,
-                url: video.url,
-                duration: video.durationFormatted,
-                thumbnail: video.thumbnail?.url,
-                source: 'youtube'
-            }));
-        } catch (error) {
-            console.error('YouTube search error:', error);
-            return [];
-        }
-    }
-
-    static async searchSpotify(query) {
-        try {
-            if (!process.env.SPOTIFY_CLIENT_ID) {
-                // Fallback to YouTube search if Spotify API not configured
-                return await this.searchYouTube(query);
-            }
-
-            const token = await spotifyApi.clientCredentialsGrant();
-            spotifyApi.setAccessToken(token.body.access_token);
-
-            const data = await spotifyApi.searchTracks(query, { limit: 5 });
-            const tracks = data.body.tracks.items;
-
-            return tracks.map(track => ({
-                title: track.name,
-                artist: track.artists[0].name,
-                url: track.external_urls.spotify,
-                duration: this.formatDuration(track.duration_ms),
-                thumbnail: track.album.images[0]?.url,
-                source: 'spotify',
-                // For actual playback, we'll search YouTube for the track
-                searchQuery: `${track.name} ${track.artists[0].name}`
-            }));
-        } catch (error) {
-            console.error('Spotify search error:', error);
-            return await this.searchYouTube(query);
-        }
-    }
-
-    static async searchSoundCloud(query) {
-        try {
-            // For v5.0.3, we'll use a different approach
-            // Since the search API might be limited, we'll fallback to YouTube
-            console.log('SoundCloud search not fully supported in v5.0.3, falling back to YouTube');
-            return await this.searchYouTube(query);
-        } catch (error) {
-            console.error('SoundCloud search error:', error);
-            return await this.searchYouTube(query);
-        }
-    }
-
-    static formatDuration(ms) {
-        const minutes = Math.floor(ms / 60000);
-        const seconds = Math.floor((ms % 60000) / 1000);
-        return `${minutes}:${seconds.toString().padStart(2, '0')}`;
-    }
-
-    static async getStreamUrl(song) {
-        try {
-            if (song.source === 'spotify' && song.searchQuery) {
-                // For Spotify, search YouTube for the actual audio
-                const youtubeResults = await this.searchYouTube(song.searchQuery);
-                if (youtubeResults.length > 0) {
-                    song = { ...song, ...youtubeResults[0] };
-                }
-            }
-
-            if (song.source === 'youtube' || song.source === 'spotify') {
-                const stream = ytdl(song.url, {
-                    filter: 'audioonly',
-                    quality: 'highestaudio',
-                    highWaterMark: 1 << 25
-                });
-                return stream;
-            } else if (song.source === 'soundcloud') {
-                // SoundCloud requires special handling - try to get stream URL
-                try {
-                    const track = await soundcloud.getTrackInfo(song.url);
-                    return track.streamURL || track.url;
-                } catch (error) {
-                    console.error('SoundCloud stream error:', error);
-                    // Fallback to YouTube search for the same query
-                    const youtubeResults = await this.searchYouTube(song.title);
-                    if (youtubeResults.length > 0) {
-                        return ytdl(youtubeResults[0].url, {
-                            filter: 'audioonly',
-                            quality: 'highestaudio',
-                            highWaterMark: 1 << 25
-                        });
-                    }
-                    throw error;
-                }
-            }
-        } catch (error) {
-            console.error('Error getting stream URL:', error);
-            throw error;
-        }
-    }
-}
-
-// Music player functions
-async function playMusic(guildId) {
-    const queue = musicQueues.get(guildId);
-    if (!queue || queue.songs.length === 0) {
-        queue.isPlaying = false;
-        return;
-    }
-
-    const song = queue.getNextSong();
-    queue.currentSong = song;
-    queue.isPlaying = true;
-    queue.isPaused = false;
-
-    try {
-        const connection = joinVoiceChannel({
-            channelId: queue.voiceChannel.id,
-            guildId: queue.guildId,
-            adapterCreator: queue.voiceChannel.guild.voiceAdapterCreator,
-        });
-
-        const player = createAudioPlayer();
-        audioPlayers.set(guildId, player);
-
-        // Get audio stream
-        const streamUrl = await MusicSourceHandler.getStreamUrl(song);
-        const resource = createAudioResource(streamUrl);
-        
-        player.play(resource);
-        connection.subscribe(player);
-
-        // Send now playing embed
-        const embed = new EmbedBuilder()
-            .setTitle('🎵 Now Playing')
-            .setDescription(`**${song.title}**`)
-            .setColor(0x00ff00)
-            .setThumbnail(song.thumbnail || null);
-
-        if (song.artist) {
-            embed.addFields({ name: 'Artist', value: song.artist, inline: true });
-        }
-        if (song.duration) {
-            embed.addFields({ name: 'Duration', value: song.duration, inline: true });
-        }
-        embed.addFields({ name: 'Source', value: song.source, inline: true });
-
-        await queue.textChannel.send({ embeds: [embed] });
-
-        // Handle player events
-        player.on(AudioPlayerStatus.Idle, () => {
-            playMusic(guildId);
-        });
-
-        player.on('error', error => {
-            console.error('Audio player error:', error);
-            queue.textChannel.send('❌ An error occurred while playing the music.');
-            playMusic(guildId);
-        });
-
-    } catch (error) {
-        console.error('Error playing music:', error);
-        queue.textChannel.send('❌ Could not play the requested song.');
-        playMusic(guildId);
-    }
-}
-
-// Slash commands
+// Slash command definitions
 const commands = [
     new SlashCommandBuilder()
         .setName('play')
         .setDescription('Play music from YouTube, Spotify, or SoundCloud')
         .addStringOption(option =>
             option.setName('query')
-                .setDescription('Song name or URL to play')
+                .setDescription('The song name or URL')
                 .setRequired(true)
         )
         .addStringOption(option =>
             option.setName('source')
-                .setDescription('Music source')
+                .setDescription('Specify the source (youtube, spotify, soundcloud)')
                 .setRequired(false)
                 .addChoices(
                     { name: 'YouTube', value: 'youtube' },
                     { name: 'Spotify', value: 'spotify' },
-                    { name: 'SoundCloud', value: 'soundcloud' },
-                    { name: 'Auto-detect', value: 'auto' }
+                    { name: 'SoundCloud', value: 'soundcloud' }
                 )
         ),
-
-    new SlashCommandBuilder()
-        .setName('pause')
-        .setDescription('Pause the current song'),
-
-    new SlashCommandBuilder()
-        .setName('resume')
-        .setDescription('Resume the paused song'),
-
     new SlashCommandBuilder()
         .setName('skip')
         .setDescription('Skip the current song'),
-
     new SlashCommandBuilder()
         .setName('stop')
-        .setDescription('Stop playing and clear the queue'),
-
+        .setDescription('Stop playing music and clear the queue'),
+    new SlashCommandBuilder()
+        .setName('pause')
+        .setDescription('Pause the current song'),
+    new SlashCommandBuilder()
+        .setName('resume')
+        .setDescription('Resume the paused song'),
     new SlashCommandBuilder()
         .setName('queue')
         .setDescription('Show the current music queue'),
-
     new SlashCommandBuilder()
         .setName('volume')
-        .setDescription('Set the volume (0-100)')
+        .setDescription('Set the bot\'s volume')
         .addIntegerOption(option =>
             option.setName('level')
                 .setDescription('Volume level (0-100)')
                 .setRequired(true)
                 .setMinValue(0)
                 .setMaxValue(100)
-        )
+        ),
+    new SlashCommandBuilder()
+        .setName('help')
+        .setDescription('Show help information and available commands')
 ];
 
 // Register slash commands
@@ -300,198 +99,359 @@ async function registerCommands() {
     }
 }
 
+// YouTube search function
+async function searchYouTube(query) {
+    try {
+        // Use yt-dlp to search and get video info with JSON output
+        const command = `yt-dlp --dump-json "ytsearch1:${query}"`;
+        const { stdout } = await execAsync(command);
+        const lines = stdout.trim().split('\n');
+        
+        if (lines.length > 0) {
+            const videoInfo = JSON.parse(lines[0]);
+            
+            if (videoInfo && videoInfo.id && videoInfo.title) {
+                const youtubeUrl = `https://www.youtube.com/watch?v=${videoInfo.id}`;
+                
+                return {
+                    title: videoInfo.title,
+                    url: youtubeUrl,
+                    duration: videoInfo.duration ? `${Math.floor(videoInfo.duration / 60)}:${(videoInfo.duration % 60).toString().padStart(2, '0')}` : 'Unknown'
+                };
+            }
+        }
+        return null;
+    } catch (error) {
+        console.error('YouTube search error:', error);
+        return null;
+    }
+}
+
+// Spotify search function
+async function searchSpotify(query) {
+    try {
+        const token = await spotifyApi.clientCredentialsGrant();
+        spotifyApi.setAccessToken(token.body.access_token);
+        
+        const data = await spotifyApi.searchTracks(query, { limit: 1 });
+        const track = data.body.tracks.items[0];
+        
+        if (track) {
+            // Search YouTube for the Spotify track
+            const youtubeQuery = `${track.name} ${track.artists[0].name}`;
+            return await searchYouTube(youtubeQuery);
+        }
+        return null;
+    } catch (error) {
+        console.error('Spotify search error:', error);
+        return null;
+    }
+}
+
+// Download audio using yt-dlp
+async function downloadAudio(url, filename) {
+    try {
+        const filepath = path.join(downloadsDir, `${filename}.mp3`);
+        const command = `yt-dlp --extract-audio --audio-format mp3 --audio-quality 0 --no-playlist --ignore-errors --no-warnings "${url}" --output "${filepath}"`;
+        
+        console.log(`Downloading: ${url}`);
+        console.log(`Saving to: ${filepath}`);
+        
+        await execAsync(command);
+        
+        // Check if file was created
+        if (fs.existsSync(filepath)) {
+            const stats = fs.statSync(filepath);
+            console.log(`✅ Download successful: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+            return filepath;
+        }
+        
+        // Try alternative approach if MP3 failed
+        console.log('MP3 conversion failed, trying alternative format...');
+        const altFilepath = path.join(downloadsDir, `${filename}.webm`);
+        const altCommand = `yt-dlp --extract-audio --audio-format webm --no-playlist --ignore-errors --no-warnings "${url}" --output "${altFilepath}"`;
+        
+        await execAsync(altCommand);
+        
+        if (fs.existsSync(altFilepath)) {
+            const stats = fs.statSync(altFilepath);
+            console.log(`✅ Download successful (WebM): ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+            return altFilepath;
+        }
+        
+        console.log('❌ Download failed: No file created');
+        return null;
+    } catch (error) {
+        console.error('Download error:', error.message);
+        return null;
+    }
+}
+
+// Clean up old files
+function cleanupOldFiles() {
+    try {
+        const files = fs.readdirSync(downloadsDir);
+        const now = Date.now();
+        const maxAge = 30 * 60 * 1000; // 30 minutes
+        
+        files.forEach(file => {
+            const filepath = path.join(downloadsDir, file);
+            const stats = fs.statSync(filepath);
+            
+            if (now - stats.mtime.getTime() > maxAge) {
+                fs.unlinkSync(filepath);
+                console.log(`Cleaned up old file: ${file}`);
+            }
+        });
+    } catch (error) {
+        console.error('Cleanup error:', error);
+    }
+}
+
+// Play audio file
+async function playAudio(interaction, filepath) {
+    try {
+        const voiceChannel = interaction.member.voice.channel;
+        const connection = joinVoiceChannel({
+            channelId: voiceChannel.id,
+            guildId: interaction.guild.id,
+            adapterCreator: interaction.guild.voiceAdapterCreator,
+        });
+
+        const player = createAudioPlayer();
+        const resource = createAudioResource(filepath);
+        
+        player.play(resource);
+        connection.subscribe(player);
+        
+        // Store player for this guild
+        audioPlayers.set(interaction.guild.id, { player, connection, filepath });
+        
+        // Clean up when finished
+        player.on(AudioPlayerStatus.Idle, () => {
+            console.log('Audio finished playing');
+            if (fs.existsSync(filepath)) {
+                fs.unlinkSync(filepath);
+                console.log(`Deleted file: ${filepath}`);
+            }
+            connection.destroy();
+            audioPlayers.delete(interaction.guild.id);
+        });
+        
+        player.on('error', error => {
+            console.error('Audio player error:', error);
+            if (fs.existsSync(filepath)) {
+                fs.unlinkSync(filepath);
+            }
+            connection.destroy();
+            audioPlayers.delete(interaction.guild.id);
+        });
+        
+        return true;
+    } catch (error) {
+        console.error('Play audio error:', error);
+        return false;
+    }
+}
+
 // Event handlers
 client.once(Events.ClientReady, () => {
     console.log(`Ready! Logged in as ${client.user.tag}`);
     registerCommands();
+    
+    // Clean up old files every 10 minutes
+    setInterval(cleanupOldFiles, 10 * 60 * 1000);
 });
 
 client.on(Events.InteractionCreate, async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
-    const { commandName, options, member, guild } = interaction;
+    const { commandName, options, guildId } = interaction;
+    const voiceChannel = interaction.member.voice.channel;
+    const textChannel = interaction.channel;
 
-    // Check if user is in a voice channel
-    if (['play', 'pause', 'resume', 'skip', 'stop', 'queue', 'volume'].includes(commandName)) {
-        if (!member.voice.channel) {
-            return interaction.reply('❌ You need to be in a voice channel to use music commands!');
-        }
+    if (!voiceChannel) {
+        return interaction.reply('❌ You need to be in a voice channel to play music!');
     }
 
-    try {
-        switch (commandName) {
-            case 'play': {
-                const query = options.getString('query');
-                const source = options.getString('source') || 'auto';
+    const permissions = voiceChannel.permissionsFor(client.user);
+    if (!permissions.has('Connect') || !permissions.has('Speak')) {
+        return interaction.reply('❌ I need the permissions to join and speak in your voice channel!');
+    }
 
+    switch (commandName) {
+        case 'play': {
+            try {
                 await interaction.deferReply();
-
-                // Detect source from URL if auto-detect
-                let detectedSource = source;
-                if (source === 'auto') {
-                    if (query.includes('youtube.com') || query.includes('youtu.be')) {
-                        detectedSource = 'youtube';
-                    } else if (query.includes('spotify.com')) {
-                        detectedSource = 'spotify';
-                    } else if (query.includes('soundcloud.com')) {
-                        detectedSource = 'soundcloud';
-                    } else {
-                        detectedSource = 'youtube'; // Default to YouTube for text searches
-                    }
+                
+                const query = options.getString('query');
+                const source = options.getString('source') || 'youtube';
+                
+                let searchResult = null;
+                
+                // Search based on source
+                if (source === 'spotify' || query.includes('open.spotify.com')) {
+                    searchResult = await searchSpotify(query);
+                } else if (query.includes('youtube.com') || query.includes('youtu.be')) {
+                    // Direct YouTube URL
+                    searchResult = { url: query, title: 'YouTube Video', duration: 'Unknown' };
+                } else {
+                    // Default to YouTube search
+                    searchResult = await searchYouTube(query);
                 }
-
-                // Search for music
-                let results = [];
-                switch (detectedSource) {
-                    case 'youtube':
-                        results = await MusicSourceHandler.searchYouTube(query);
-                        break;
-                    case 'spotify':
-                        results = await MusicSourceHandler.searchSpotify(query);
-                        break;
-                    case 'soundcloud':
-                        results = await MusicSourceHandler.searchSoundCloud(query);
-                        break;
-                }
-
-                if (results.length === 0) {
+                
+                if (!searchResult) {
                     return interaction.editReply('❌ No results found for your search.');
                 }
-
-                // Get or create music queue
-                let queue = musicQueues.get(guild.id);
-                if (!queue) {
-                    queue = new MusicQueue(guild.id, member.voice.channel, interaction.channel);
-                    musicQueues.set(guild.id, queue);
+                
+                // Generate filename
+                const filename = `song_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+                
+                // Download audio
+                const filepath = await downloadAudio(searchResult.url, filename);
+                if (!filepath) {
+                    return interaction.editReply('❌ Failed to download audio.');
                 }
-
-                // Add song to queue
-                const song = results[0];
-                queue.addSong(song);
-
-                const embed = new EmbedBuilder()
-                    .setTitle('🎵 Added to Queue')
-                    .setDescription(`**${song.title}**`)
-                    .setColor(0x00ff00)
-                    .setThumbnail(song.thumbnail || null);
-
-                if (song.artist) {
-                    embed.addFields({ name: 'Artist', value: song.artist, inline: true });
+                
+                // Play audio
+                const success = await playAudio(interaction, filepath);
+                if (!success) {
+                    return interaction.editReply('❌ Failed to play audio.');
                 }
-                if (song.duration) {
-                    embed.addFields({ name: 'Duration', value: song.duration, inline: true });
-                }
-                embed.addFields({ name: 'Source', value: song.source, inline: true });
-
-                await interaction.editReply({ embeds: [embed] });
-
-                // Start playing if not already playing
-                if (!queue.isPlaying) {
-                    playMusic(guild.id);
-                }
-                break;
-            }
-
-            case 'pause': {
-                const player = audioPlayers.get(guild.id);
-                if (player && player.state.status === AudioPlayerStatus.Playing) {
-                    player.pause();
-                    musicQueues.get(guild.id).isPaused = true;
-                    interaction.reply('⏸️ Music paused.');
-                } else {
-                    interaction.reply('❌ No music is currently playing.');
-                }
-                break;
-            }
-
-            case 'resume': {
-                const player = audioPlayers.get(guild.id);
-                if (player && player.state.status === AudioPlayerStatus.Paused) {
-                    player.unpause();
-                    musicQueues.get(guild.id).isPaused = false;
-                    interaction.reply('▶️ Music resumed.');
-                } else {
-                    interaction.reply('❌ No music is currently paused.');
-                }
-                break;
-            }
-
-            case 'skip': {
-                const player = audioPlayers.get(guild.id);
-                if (player) {
-                    player.stop();
-                    interaction.reply('⏭️ Skipped current song.');
-                } else {
-                    interaction.reply('❌ No music is currently playing.');
-                }
-                break;
-            }
-
-            case 'stop': {
-                const player = audioPlayers.get(guild.id);
-                if (player) {
-                    player.stop();
-                }
-                const queue = musicQueues.get(guild.id);
-                if (queue) {
-                    queue.clear();
-                }
-                interaction.reply('⏹️ Stopped playing and cleared queue.');
-                break;
-            }
-
-            case 'queue': {
-                const queue = musicQueues.get(guild.id);
-                if (!queue || queue.songs.length === 0) {
-                    return interaction.reply('❌ The queue is empty.');
-                }
-
-                const embed = new EmbedBuilder()
-                    .setTitle('🎵 Music Queue')
-                    .setColor(0x00ff00);
-
-                let description = '';
-                if (queue.currentSong) {
-                    description += `**Now Playing:** ${queue.currentSong.title}\n\n`;
-                }
-
-                if (queue.songs.length > 0) {
-                    description += '**Up Next:**\n';
-                    queue.songs.slice(0, 10).forEach((song, index) => {
-                        description += `${index + 1}. ${song.title}\n`;
-                    });
-                    if (queue.songs.length > 10) {
-                        description += `... and ${queue.songs.length - 10} more songs`;
+                
+                interaction.editReply(`🎵 Now playing: **${searchResult.title}**`);
+                
+            } catch (error) {
+                console.error('Play error:', error);
+                try {
+                    if (interaction.deferred) {
+                        await interaction.editReply(`❌ An error occurred: ${error.message}`);
+                    } else {
+                        await interaction.reply(`❌ An error occurred: ${error.message}`);
                     }
+                } catch (replyError) {
+                    console.error('Failed to send error reply:', replyError);
                 }
-
-                embed.setDescription(description);
-                interaction.reply({ embeds: [embed] });
-                break;
             }
-
-            case 'volume': {
-                const volume = options.getInteger('level') / 100;
-                const queue = musicQueues.get(guild.id);
-                if (queue) {
-                    queue.volume = volume;
-                    interaction.reply(`🔊 Volume set to ${options.getInteger('level')}%`);
-                } else {
-                    interaction.reply('❌ No music queue found.');
-                }
-                break;
-            }
+            break;
         }
-    } catch (error) {
-        console.error('Command error:', error);
-        const errorMessage = '❌ An error occurred while processing your command.';
-        if (interaction.deferred) {
-            interaction.editReply(errorMessage);
-        } else {
-            interaction.reply(errorMessage);
+
+        case 'skip': {
+            const playerData = audioPlayers.get(interaction.guild.id);
+            if (!playerData || !playerData.player) {
+                return interaction.reply('❌ No music is currently playing.');
+            }
+            
+            // Delete the current file before skipping
+            if (playerData.filepath && fs.existsSync(playerData.filepath)) {
+                try {
+                    fs.unlinkSync(playerData.filepath);
+                    console.log(`🗑️ Deleted file (skip): ${playerData.filepath}`);
+                } catch (error) {
+                    console.error('Error deleting file:', error);
+                }
+            }
+            
+            playerData.player.stop();
+            interaction.reply('⏭️ Skipping song...');
+            break;
+        }
+
+        case 'stop': {
+            const playerData = audioPlayers.get(interaction.guild.id);
+            if (!playerData || !playerData.player) {
+                return interaction.reply('❌ No music is currently playing.');
+            }
+            
+            // Stop the player and destroy connection
+            playerData.player.stop();
+            playerData.connection.destroy();
+            
+            // Delete the audio file if it exists
+            if (playerData.filepath && fs.existsSync(playerData.filepath)) {
+                try {
+                    fs.unlinkSync(playerData.filepath);
+                    console.log(`🗑️ Deleted file: ${playerData.filepath}`);
+                } catch (error) {
+                    console.error('Error deleting file:', error);
+                }
+            }
+            
+            // Remove from audioPlayers map
+            audioPlayers.delete(interaction.guild.id);
+            interaction.reply('⏹️ Music stopped and file deleted!');
+            break;
+        }
+
+        case 'pause': {
+            const playerData = audioPlayers.get(interaction.guild.id);
+            if (!playerData || !playerData.player) {
+                return interaction.reply('❌ No music is currently playing.');
+            }
+            playerData.player.pause();
+            interaction.reply('⏸️ Music paused.');
+            break;
+        }
+
+        case 'resume': {
+            const playerData = audioPlayers.get(interaction.guild.id);
+            if (!playerData || !playerData.player) {
+                return interaction.reply('❌ No music is currently playing.');
+            }
+            playerData.player.unpause();
+            interaction.reply('▶️ Music resumed.');
+            break;
+        }
+
+        case 'queue': {
+            interaction.reply('❌ Queue functionality not implemented yet. This bot plays one song at a time.');
+            break;
+        }
+
+        case 'volume': {
+            interaction.reply('❌ Volume control not implemented yet.');
+            break;
+        }
+
+        case 'help': {
+            const helpEmbed = new EmbedBuilder()
+                .setTitle('🎵 yt-dlp Music Bot Help')
+                .setDescription('A Discord music bot that downloads and plays music using yt-dlp!')
+                .setColor(0x00ff00)
+                .setThumbnail(client.user.displayAvatarURL())
+                .addFields(
+                    {
+                        name: '🎵 Music Commands',
+                        value: '`/play <query> [source]` - Play music from search or URL\n`/pause` - Pause the current song\n`/resume` - Resume the paused song\n`/skip` - Skip to the next song\n`/stop` - Stop playing music',
+                        inline: false
+                    },
+                    {
+                        name: '🎯 Supported Sources',
+                        value: '**YouTube** - Direct URLs and search by name\n**Spotify** - Search by name/URL (converts to YouTube for streaming)\n**SoundCloud** - URLs fallback to YouTube search\n**Auto-detect** - Automatically detects source from URL',
+                        inline: false
+                    },
+                    {
+                        name: '💡 Usage Examples',
+                        value: '`/play Never Gonna Give You Up`\n`/play https://youtube.com/watch?v=dQw4w9WgXcQ`\n`/play Bohemian Rhapsody source:spotify`\n`/play https://open.spotify.com/track/4iV5W9uYEdYUVa79Axb7Rh`',
+                        inline: false
+                    },
+                    {
+                        name: '⚙️ How It Works',
+                        value: '• Downloads audio using yt-dlp (bypasses YouTube restrictions)\n• Plays local MP3 files\n• Automatically deletes files after playing\n• Cleans up old files every 10 minutes',
+                        inline: false
+                    }
+                )
+                .setFooter({ text: 'Made with ❤️ and yt-dlp' })
+                .setTimestamp();
+            interaction.reply({ embeds: [helpEmbed] });
+            break;
+        }
+
+        default: {
+            interaction.reply('❌ Unknown command.');
+            break;
         }
     }
 });
 
-// Login to Discord
 client.login(process.env.DISCORD_TOKEN);

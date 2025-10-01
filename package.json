@@ -7,20 +7,38 @@
     "start": "node index.js",
     "dev": "nodemon index.js"
   },
-  "keywords": ["discord", "bot", "music", "streaming", "spotify", "youtube", "soundcloud"],
+  "keywords": [
+    "discord",
+    "bot",
+    "music",
+    "streaming",
+    "spotify",
+    "youtube",
+    "soundcloud"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@discordjs/opus": "^0.10.0",
+    "@discordjs/voice": "^0.18.0",
+    "@evan/opus": "^1.0.3",
+    "axios": "^1.12.2",
+    "discord-player": "^7.1.0",
+    "discord-player-youtube": "^0.5.6",
+    "discord-player-ytdlp": "^1.0.4",
     "discord.js": "^14.15.3",
-    "@discordjs/voice": "^0.19.0",
-    "ytdl-core": "^4.11.5",
-    "youtube-sr": "^4.3.4",
-    "spotify-web-api-node": "^5.0.2",
-    "soundcloud-scraper": "^5.0.3",
+    "dotenv": "^16.3.1",
     "ffmpeg-static": "^5.2.0",
     "libsodium-wrappers": "^0.7.11",
+    "mediaplex-darwin-arm64": "^1.0.0",
+    "node-fetch": "^2.7.0",
+    "opusscript": "^0.0.8",
+    "play-dl": "^1.9.7",
+    "spotify-web-api-node": "^5.0.2",
     "tweetnacl": "^1.0.3",
-    "dotenv": "^16.3.1"
+    "youtube-sr": "^4.3.4",
+    "youtubei.js": "^15.1.1",
+    "ytdl-core": "^4.11.5"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"

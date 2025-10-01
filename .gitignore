@@ -11,8 +11,11 @@ yarn-error.log*
 .env.test.local
 .env.production.local
 
+# Downloaded audio files
+downloads/
+temp/
+
 # Logs
-logs
 *.log
 
 # Runtime data
@@ -28,7 +31,6 @@ coverage/
 .nyc_output
 
 # Dependency directories
-node_modules/
 jspm_packages/
 
 # Optional npm cache directory

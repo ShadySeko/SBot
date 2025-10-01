@@ -63,7 +63,36 @@ A powerful Discord bot that can stream music from YouTube, Spotify, and SoundClo
 3. Copy the Client ID and Client Secret to your `.env` file
 4. Note: Without Spotify API credentials, Spotify searches will fallback to YouTube
 
-### 5. Running the Bot
+### 5. YouTube Authentication (Recommended for better reliability)
+
+YouTube has been restricting access for unauthenticated users. For better reliability:
+
+#### Method 1: Official Method (Recommended)
+1. Open a new incognito/private window in your browser
+2. Log into YouTube in the incognito window
+3. Open DevTools (F12)
+4. Go to the Network tab
+5. Copy the value of the Cookie header from any request to youtube.com
+6. Create a file called `cookies.txt` and paste the cookie string there
+7. Run the cookie extractor:
+   ```bash
+   node get-cookies.js
+   ```
+
+#### Method 2: EditThisCookie Extension (Alternative)
+1. Install [EditThisCookie](https://chrome.google.com/webstore/detail/editthiscookie/fngmhnnpilhplaeedifhccceomclgfbg) browser extension
+2. Go to YouTube.com and log in to your account
+3. Click the EditThisCookie extension icon
+4. Click "Export" to copy cookies to clipboard
+5. Create a file called `cookies-raw.txt` and paste the cookies there
+6. Run the cookie extractor:
+   ```bash
+   node get-cookies.js
+   ```
+
+**Note**: Without cookies, the bot may have limited access to some YouTube videos.
+
+### 6. Running the Bot
 
 ```bash
 # Development mode (with auto-restart)
@@ -131,6 +160,11 @@ All commands are slash commands:
 3. **Spotify searches not working**
    - Ensure Spotify API credentials are properly configured
    - Check if the Spotify app has the correct permissions
+
+4. **YouTube videos showing as "unavailable"**
+   - This is likely due to YouTube's anti-bot measures
+   - Set up YouTube authentication using cookies (see step 5 above)
+   - The bot will try multiple fallback methods automatically
 
 ### Dependencies
 
