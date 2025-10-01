@@ -38,6 +38,12 @@ sudo apt update
 sudo apt install yt-dlp ffmpeg
 ```
 
+**On WSL (Windows Subsystem for Linux):**
+```bash
+sudo apt update
+sudo apt install yt-dlp ffmpeg
+```
+
 **On Windows:**
 - Download yt-dlp from https://github.com/yt-dlp/yt-dlp/releases
 - Download ffmpeg from https://ffmpeg.org/download.html

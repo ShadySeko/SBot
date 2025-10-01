@@ -25,6 +25,7 @@
     "dotenv": "^16.3.1",
     "ffmpeg-static": "^5.2.0",
     "libsodium-wrappers": "^0.7.11",
+    "nopt": "^7.2.0",
     "spotify-web-api-node": "^5.0.2",
     "tweetnacl": "^1.0.3"
   },
