@@ -1,10 +1,11 @@
 const { Client, GatewayIntentBits, Events, EmbedBuilder, SlashCommandBuilder, REST, Routes } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } = require('@discordjs/voice');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, StreamType } = require('@discordjs/voice');
 const { exec } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
 const SpotifyWebApi = require('spotify-web-api-node');
+const axios = require('axios');
 require('dotenv').config();
 
 const execAsync = promisify(exec);
@@ -32,6 +33,29 @@ const downloadsDir = path.join(__dirname, 'downloads');
 if (!fs.existsSync(downloadsDir)) {
     fs.mkdirSync(downloadsDir, { recursive: true });
 }
+
+const { spawn } = require('child_process');
+const ffmpegPath = process.env.FFMPEG_PATH || 'ffmpeg'; // use system ffmpeg (8.0). Set env to override.
+
+// Replace the getStreamUrl function
+async function getStreamUrl(url) {
+    try {
+        // Get a more reliable stream URL with better format selection
+        const command = `yt-dlp --get-url --format "bestaudio[ext=webm][acodec=opus]/bestaudio[ext=m4a]/bestaudio" --no-warnings "${url}"`;
+        const { stdout } = await execAsync(command, { timeout: 10000 });
+        const streamUrl = stdout.trim();
+        
+        if (!streamUrl || streamUrl.includes('ERROR')) {
+            return null;
+        }
+        
+        return streamUrl;
+    } catch (error) {
+        console.error('Error getting stream URL:', error);
+        return null;
+    }
+}
+
 
 // Slash command definitions
 const commands = [
@@ -208,7 +232,8 @@ function cleanupOldFiles() {
     }
 }
 
-// Play audio file
+
+// Uncomment and modify the playAudio function
 async function playAudio(interaction, filepath) {
     try {
         const voiceChannel = interaction.member.voice.channel;
@@ -219,13 +244,21 @@ async function playAudio(interaction, filepath) {
         });
 
         const player = createAudioPlayer();
-        const resource = createAudioResource(filepath);
+        const resource = createAudioResource(filepath, {
+            inlineVolume: true,
+            bufferingTimeout: 7000
+        });
         
         player.play(resource);
         connection.subscribe(player);
         
-        // Store player for this guild
-        audioPlayers.set(interaction.guild.id, { player, connection, filepath });
+        // Store player for this guild (include filepath for cleanup)
+        audioPlayers.set(interaction.guild.id, { 
+            player, 
+            connection, 
+            filepath,
+            title: 'Downloaded Audio' // Add a default title
+        });
         
         // Clean up when finished
         player.on(AudioPlayerStatus.Idle, () => {
@@ -253,6 +286,205 @@ async function playAudio(interaction, filepath) {
         return false;
     }
 }
+
+
+// Replace the playAudioStream function with better error handling
+async function playAudioStream(interaction, url, title, connection) {
+    try {
+        const streamUrl = await getStreamUrl(url);
+        if (!streamUrl || !(await isStreamUrlValid(streamUrl))) {
+            throw new Error('Invalid stream URL');
+        }
+
+        // Create FFmpeg process for streaming
+        const ffmpeg = spawn('ffmpeg', [
+            '-i', streamUrl,
+            '-f', 's16le',
+            '-ar', '48000',
+            '-ac', '2',
+            '-loglevel', 'error',
+            '-bufsize', '256k',  // Increased buffer size
+            '-timeout', '5000000', // Increased timeout
+            '-'
+        ]);
+
+        let streamStarted = false;
+        let streamError = false;
+
+        // Monitor FFmpeg for errors
+        ffmpeg.stderr.on('data', (data) => {
+            const errorMsg = data.toString();
+            console.error(`FFmpeg stderr: ${errorMsg}`);
+            
+            // Check for critical errors that should trigger fallback
+            if (errorMsg.includes('Error in the pull function') || 
+                errorMsg.includes('Read error') || 
+                errorMsg.includes('session has been invalidated') ||
+                errorMsg.includes('Input/output error')) {
+                streamError = true;
+                console.log('🚨 Critical streaming error detected, will use fallback');
+            }
+        });
+
+        ffmpeg.on('error', (error) => {
+            console.error('FFmpeg process error:', error);
+            streamError = true;
+        });
+
+        // Give FFmpeg a moment to start and check for immediate errors
+        await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                if (streamError) {
+                    reject(new Error('FFmpeg stream failed to start'));
+                } else {
+                    streamStarted = true;
+                    resolve();
+                }
+            }, 2000); // Wait 2 seconds for stream to stabilize
+
+            ffmpeg.on('error', () => {
+                clearTimeout(timeout);
+                reject(new Error('FFmpeg error during startup'));
+            });
+        });
+
+        const player = createAudioPlayer();
+        const resource = createAudioResource(ffmpeg.stdout, {
+            inputType: 'raw',
+            inlineVolume: true
+        });
+        
+        player.play(resource);
+        connection.subscribe(player);
+        
+        // Store player for this guild
+        audioPlayers.set(interaction.guild.id, { 
+            player, 
+            connection, 
+            ffmpeg,
+            title 
+        });
+        
+        // Clean up when finished
+        player.on(AudioPlayerStatus.Idle, () => {
+            console.log('Audio finished playing');
+            if (ffmpeg && !ffmpeg.killed) {
+                ffmpeg.kill('SIGKILL');
+            }
+            connection.destroy();
+            audioPlayers.delete(interaction.guild.id);
+        });
+        
+        player.on('error', error => {
+            console.error('Audio player error:', error);
+            if (ffmpeg && !ffmpeg.killed) {
+                ffmpeg.kill('SIGKILL');
+            }
+            connection.destroy();
+            audioPlayers.delete(interaction.guild.id);
+        });
+        
+        return true;
+    } catch (error) {
+        console.error('Play audio stream error:', error);
+        return false;
+    }
+}
+
+
+// Stream via yt-dlp piping into ffmpeg (more resilient than FFmpeg pulling googlevideo directly)
+async function playAudioStreamViaYtDlp(interaction, url, title, connection) {
+    try {
+        const ytdlpCmd = process.env.YTDLP_PATH || 'yt-dlp';
+
+        const ytdlp = spawn(ytdlpCmd, [
+            '-o', '-',                         // write media to stdout
+            '--no-playlist',
+            '--quiet', '--no-warnings',
+            '--retries', 'infinite',
+            '--fragment-retries', 'infinite',
+            '--http-chunk-size', '1M',         // range requests help with flaky CDNs
+            '--geo-bypass',
+            '--force-ipv4',                    // avoids some IPv6 edge-cases
+            '-f', 'bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio',
+            // '--extractor-args', 'youtube:player_client=android', // optional: often more stable
+            url
+        ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+        const ffmpeg = spawn(ffmpegPath, [
+            '-loglevel', 'warning',
+            '-i', 'pipe:0',
+            '-f', 's16le',
+            '-ar', '48000',
+            '-ac', '2',
+            'pipe:1'
+        ], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+        // Pipe yt-dlp -> ffmpeg
+        ytdlp.stdout.pipe(ffmpeg.stdin);
+
+        const player = createAudioPlayer();
+        const resource = createAudioResource(ffmpeg.stdout, {
+            inputType: StreamType.Raw,
+            inlineVolume: true
+        });
+
+        player.play(resource);
+        connection.subscribe(player);
+
+        // Track processes for cleanup
+        audioPlayers.set(interaction.guild.id, {
+            player, connection, ffmpeg, ytdlp, title
+        });
+
+        ytdlp.stderr.on('data', d => console.error(`yt-dlp: ${d.toString()}`));
+        ffmpeg.stderr.on('data', d => console.error(`ffmpeg: ${d.toString()}`));
+
+        const cleanup = () => {
+            try { if (ytdlp && !ytdlp.killed) ytdlp.kill('SIGKILL'); } catch {}
+            try { if (ffmpeg && !ffmpeg.killed) ffmpeg.kill('SIGKILL'); } catch {}
+            try { connection.destroy(); } catch {}
+            audioPlayers.delete(interaction.guild.id);
+        };
+
+        player.on(AudioPlayerStatus.Idle, cleanup);
+        player.on('error', err => { console.error('player error:', err); cleanup(); });
+
+        ytdlp.on('close', code => {
+            if (code !== 0) console.error(`yt-dlp exited with code ${code}`);
+        });
+
+        return true;
+    } catch (e) {
+        console.error('playAudioStreamViaYtDlp error:', e);
+        return false;
+    }
+}
+
+// Hybrid: try streaming via yt-dlp->ffmpeg, fallback to download+file playback
+async function playAudioHybrid(interaction, url, title) {
+    try {
+        const voiceChannel = interaction.member.voice.channel;
+        const connection = joinVoiceChannel({
+            channelId: voiceChannel.id,
+            guildId: interaction.guild.id,
+            adapterCreator: interaction.guild.voiceAdapterCreator
+        });
+
+        const ok = await playAudioStreamViaYtDlp(interaction, url, title, connection);
+        if (ok) return true;
+
+        // Fallback: download then play from file (requires downloadAudio and playAudio functions)
+        const filename = `song_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        const filepath = await downloadAudio(url, filename);
+        if (!filepath) return false;
+        return await playAudio(interaction, filepath);
+    } catch (err) {
+        console.error('Hybrid play error:', err);
+        return false;
+    }
+}
+
 
 // Event handlers
 client.once(Events.ClientReady, () => {
@@ -283,104 +515,55 @@ client.on(Events.InteractionCreate, async interaction => {
         case 'play': {
             try {
                 await interaction.deferReply();
-                
                 const query = options.getString('query');
                 const source = options.getString('source') || 'youtube';
-                
+
                 let searchResult = null;
-                
-                // Search based on source
                 if (source === 'spotify' || query.includes('open.spotify.com')) {
                     searchResult = await searchSpotify(query);
                 } else if (query.includes('youtube.com') || query.includes('youtu.be')) {
-                    // Direct YouTube URL
                     searchResult = { url: query, title: 'YouTube Video', duration: 'Unknown' };
                 } else {
-                    // Default to YouTube search
                     searchResult = await searchYouTube(query);
                 }
-                
+
                 if (!searchResult) {
                     return interaction.editReply('❌ No results found for your search.');
                 }
-                
-                // Generate filename
-                const filename = `song_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-                
-                // Download audio
-                const filepath = await downloadAudio(searchResult.url, filename);
-                if (!filepath) {
-                    return interaction.editReply('❌ Failed to download audio.');
-                }
-                
-                // Play audio
-                const success = await playAudio(interaction, filepath);
-                if (!success) {
-                    return interaction.editReply('❌ Failed to play audio.');
-                }
-                
-                interaction.editReply(`🎵 Now playing: **${searchResult.title}**`);
-                
-            } catch (error) {
-                console.error('Play error:', error);
-                try {
-                    if (interaction.deferred) {
-                        await interaction.editReply(`❌ An error occurred: ${error.message}`);
-                    } else {
-                        await interaction.reply(`❌ An error occurred: ${error.message}`);
-                    }
-                } catch (replyError) {
-                    console.error('Failed to send error reply:', replyError);
-                }
+
+                await interaction.editReply(`🔄 Loading: **${searchResult.title}**...`);
+                const success = await playAudioHybrid(interaction, searchResult.url, searchResult.title);
+                if (!success) return interaction.editReply('❌ Failed to play audio.');
+
+                const d = audioPlayers.get(interaction.guild.id);
+                const method = d && d.ytdlp ? '🌐 Streaming' : '💾 Downloaded';
+                return interaction.editReply(`🎵 Now playing: **${searchResult.title}** (${method})`);
+            } catch (e) {
+                console.error('Play error:', e);
+                if (interaction.deferred) return interaction.editReply(`❌ ${e.message}`);
+                return interaction.reply(`❌ ${e.message}`);
             }
             break;
         }
 
         case 'skip': {
-            const playerData = audioPlayers.get(interaction.guild.id);
-            if (!playerData || !playerData.player) {
-                return interaction.reply('❌ No music is currently playing.');
-            }
-            
-            // Delete the current file before skipping
-            if (playerData.filepath && fs.existsSync(playerData.filepath)) {
-                try {
-                    fs.unlinkSync(playerData.filepath);
-                    console.log(`🗑️ Deleted file (skip): ${playerData.filepath}`);
-                } catch (error) {
-                    console.error('Error deleting file:', error);
-                }
-            }
-            
-            playerData.player.stop();
-            interaction.reply('⏭️ Skipping song...');
-            break;
+            const d = audioPlayers.get(interaction.guild.id);
+            if (!d) return interaction.reply('❌ No music is currently playing.');
+            try { if (d.ytdlp && !d.ytdlp.killed) d.ytdlp.kill('SIGKILL'); } catch {}
+            try { if (d.ffmpeg && !d.ffmpeg.killed) d.ffmpeg.kill('SIGKILL'); } catch {}
+            d.player.stop();
+            return interaction.reply('⏭️ Skipping song...');
         }
 
         case 'stop': {
-            const playerData = audioPlayers.get(interaction.guild.id);
-            if (!playerData || !playerData.player) {
-                return interaction.reply('❌ No music is currently playing.');
-            }
-            
-            // Stop the player and destroy connection
-            playerData.player.stop();
-            playerData.connection.destroy();
-            
-            // Delete the audio file if it exists
-            if (playerData.filepath && fs.existsSync(playerData.filepath)) {
-                try {
-                    fs.unlinkSync(playerData.filepath);
-                    console.log(`🗑️ Deleted file: ${playerData.filepath}`);
-                } catch (error) {
-                    console.error('Error deleting file:', error);
-                }
-            }
-            
-            // Remove from audioPlayers map
+            const d = audioPlayers.get(interaction.guild.id);
+            if (!d) return interaction.reply('❌ No music is currently playing.');
+            try { if (d.ytdlp && !d.ytdlp.killed) d.ytdlp.kill('SIGKILL'); } catch {}
+            try { if (d.ffmpeg && !d.ffmpeg.killed) d.ffmpeg.kill('SIGKILL'); } catch {}
+            d.player.stop();
+            d.connection.destroy();
             audioPlayers.delete(interaction.guild.id);
-            interaction.reply('⏹️ Music stopped and file deleted!');
-            break;
+            return interaction.reply('⏹️ Music stopped!');
         }
 
         case 'pause': {
@@ -415,8 +598,8 @@ client.on(Events.InteractionCreate, async interaction => {
 
         case 'help': {
             const helpEmbed = new EmbedBuilder()
-                .setTitle('🎵 yt-dlp Music Bot Help')
-                .setDescription('A Discord music bot that downloads and plays music using yt-dlp!')
+                .setTitle('🎵Music Bot Help')
+                .setDescription('A Discord music bot that downloads and plays music using yt-dlp! Ca va vous? Moi oui.')
                 .setColor(0x00ff00)
                 .setThumbnail(client.user.displayAvatarURL())
                 .addFields(
@@ -437,11 +620,11 @@ client.on(Events.InteractionCreate, async interaction => {
                     },
                     {
                         name: '⚙️ How It Works',
-                        value: '• Downloads audio using yt-dlp (bypasses YouTube restrictions)\n• Plays local MP3 files\n• Automatically deletes files after playing\n• Cleans up old files every 10 minutes',
+                        value: '• Downloads audio using yt-dlp\n• Plays local MP3 files\n• Automatically deletes files after playing\n• Cleans up old files every 10 minutes',
                         inline: false
                     }
                 )
-                .setFooter({ text: 'Made with ❤️ and yt-dlp' })
+                .setFooter({ text: 'T\'as lu jusque la batard?' })
                 .setTimestamp();
             interaction.reply({ embeds: [helpEmbed] });
             break;
@@ -453,5 +636,16 @@ client.on(Events.InteractionCreate, async interaction => {
         }
     }
 });
+
+// Check if the stream URL is valid
+async function isStreamUrlValid(url) {
+    try {
+        const response = await axios.head(url, { timeout: 5000 });
+        return response.status === 200;
+    } catch (error) {
+        console.error('Stream URL validation error:', error.message);
+        return false;
+    }
+}
 
 client.login(process.env.DISCORD_TOKEN);
